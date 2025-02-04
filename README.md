@@ -22,7 +22,7 @@
 Twitter AI Agent is perfect for individuals or organizations looking to:  
 - Automate their Twitter activity with minimal manual effort.  
 - Maintain high engagement and relevance in their niche.  
-- Leverage AI to create impactful and timely Twitter interactions.  
+- Leverage AI to create impactful and timely Twitter interaction.  
 
 Whether you're a social media manager, influencer, or a tech-savvy professional, this tool is your ultimate assistant for optimizing Twitter strategies. 🚀  
 
