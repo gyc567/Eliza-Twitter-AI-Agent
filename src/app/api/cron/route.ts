@@ -119,10 +119,23 @@ async function runTweetJob() {
   const randomNumber = Math.random();
   
   const topic = randomNumber < 0.5 ? prioritizedTopics[Math.floor(Math.random() * prioritizedTopics.length)] : otherTopics[Math.floor(Math.random() * otherTopics.length)];
-  const tweet = await generateTweet(topic);
-  if (tweet) {
-    await postTweet(tweet);
-    await incrementTweetCountInRedis();
+  
+  try {
+    const tweet = await generateTweet(topic);
+    if (tweet) {
+      console.log("----tweet----",tweet);
+      await postTweet(tweet);
+      await incrementTweetCountInRedis();
+      console.log(`Successfully posted tweet about: ${topic}`);
+    }
+  } catch (error: any) {
+    console.error(`Failed to generate/post tweet about ${topic}:`, error.message);
+    
+    // Don't throw error to prevent cron job from failing completely
+    // Just log and continue
+    if (error.message?.includes('Google API temporarily unavailable')) {
+      console.log('Skipping this tweet cycle due to API issues');
+    }
   }
 }
 

@@ -1,40 +1,44 @@
-import { HumanMessage} from '@langchain/core/messages';
+import { HumanMessage } from '@langchain/core/messages';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { createReactAgent } from '@langchain/langgraph/prebuilt';
-import { postTool, replyTool, mentionTool, accountDetailsTools , trendingTopicsTool, searchTweetsTool, likeTweet, scrapDataOnlineTool} from './twitterApi';
+import { postTool, replyTool, mentionTool, accountDetailsTools, trendingTopicsTool, searchTweetsTool, likeTweet, scrapDataOnlineTool } from './twitterApi';
+import { callGeminiWithCurl } from './geminiCurl';
+import { postTweetFallback, testTwitterConnection } from './twitterFallback';
 
 
 
-interface props{
- 
-    id_str:string,
-    user:{
-      screen_name:string,
-    }
-  
+interface props {
+
+  id_str: string,
+  user: {
+    screen_name: string,
+  }
+
 }
-interface msgProps{
-  name:string
+interface msgProps {
+  name: string
 }
-interface tweetlikeprops{
-  id_str:string,
-  text:string,
-  user:{
-    screen_name:string,
-    id_str:string
+interface tweetlikeprops {
+  id_str: string,
+  text: string,
+  user: {
+    screen_name: string,
+    id_str: string
   }
 }
 // Initialize tools and LLM agent
-const tools = [postTool, replyTool, mentionTool, accountDetailsTools,trendingTopicsTool, searchTweetsTool, likeTweet, scrapDataOnlineTool];
+const tools = [postTool, replyTool, mentionTool, accountDetailsTools, trendingTopicsTool, searchTweetsTool, likeTweet, scrapDataOnlineTool];
 const chat = new ChatGoogleGenerativeAI({
-  model: 'gemini-1.5-flash',
-  apiKey: process.env.NEXT_PUBLIC_GOOGLE_API_KEY ,// Use env variable for API key
+  model: 'gemini-2.0-flash-exp', // 使用可用的模型版本
+  apiKey: process.env.GOOGLE_API_KEY, // Server-side only
   maxOutputTokens: 200,
-  temperature:0.8,
-  
+  temperature: 0.8,
+  // Add retry configuration
+  maxRetries: 3,
 });
-if (!process.env.NEXT_PUBLIC_GOOGLE_API_KEY) {
-  throw new Error('API Key not found. Please set the NEXT_PUBLIC_GOOGLE_API_KEY environment variable.');
+
+if (!process.env.GOOGLE_API_KEY) {
+  throw new Error('API Key not found. Please set the GOOGLE_API_KEY environment variable.');
 }
 const agent = createReactAgent({
   llm: chat,
@@ -43,27 +47,155 @@ const agent = createReactAgent({
 // Topics for tweeting
 
 
+// Rate limiting and circuit breaker
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+let lastApiCall = 0;
+const MIN_DELAY_BETWEEN_CALLS = 2000; // 2 seconds between API calls
+
+// Circuit breaker state
+let circuitBreakerState = {
+  failures: 0,
+  lastFailureTime: 0,
+  isOpen: false
+};
+
+const MAX_FAILURES = 3;
+const CIRCUIT_BREAKER_TIMEOUT = 300000; // 5 minutes
+
+function isCircuitBreakerOpen(): boolean {
+  if (circuitBreakerState.isOpen) {
+    const now = Date.now();
+    if (now - circuitBreakerState.lastFailureTime > CIRCUIT_BREAKER_TIMEOUT) {
+      // Reset circuit breaker after timeout
+      circuitBreakerState = { failures: 0, lastFailureTime: 0, isOpen: false };
+      console.log('Circuit breaker reset - attempting API calls again');
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function recordFailure(): void {
+  circuitBreakerState.failures++;
+  circuitBreakerState.lastFailureTime = Date.now();
+
+  if (circuitBreakerState.failures >= MAX_FAILURES) {
+    circuitBreakerState.isOpen = true;
+    console.log(`Circuit breaker opened after ${MAX_FAILURES} failures. Will retry after ${CIRCUIT_BREAKER_TIMEOUT / 1000} seconds.`);
+  }
+}
+
+function recordSuccess(): void {
+  circuitBreakerState = { failures: 0, lastFailureTime: 0, isOpen: false };
+}
+
+async function rateLimitedApiCall<T>(apiCall: () => Promise<T>): Promise<T> {
+  if (isCircuitBreakerOpen()) {
+    throw new Error('Circuit breaker is open - Google API temporarily disabled due to repeated failures');
+  }
+
+  const now = Date.now();
+  const timeSinceLastCall = now - lastApiCall;
+
+  if (timeSinceLastCall < MIN_DELAY_BETWEEN_CALLS) {
+    await delay(MIN_DELAY_BETWEEN_CALLS - timeSinceLastCall);
+  }
+
+  lastApiCall = Date.now();
+
+  try {
+    const result = await apiCall();
+    recordSuccess();
+    return result;
+  } catch (error) {
+    recordFailure();
+    throw error;
+  }
+}
+
+// 备用的简单 tweet 生成函数
+async function generateTweetWithCurl(topic: string): Promise<string> {
+  const prompt = `Create a creative tweet about ${topic}. Add emojis to express sentiment. Keep it under 280 characters and engaging.`;
+
+  try {
+    const response = await callGeminiWithCurl(prompt, process.env.GOOGLE_API_KEY!);
+    return response;
+  } catch (error) {
+    console.error('Curl fallback also failed:', error);
+    throw error;
+  }
+}
+
 // Function to generate and post tweets about a topic
 export async function generateTweet(topic: string) {
+  console.log("----topic-----", topic);
+
   try {
-    const response = await agent.invoke({
-      messages: new HumanMessage(`Post a creative tweet about ${topic} & add emoji to express your sentiments,possiblly add image if you can`),
+    // 首先尝试使用 LangChain agent
+    const response = await rateLimitedApiCall(async () => {
+      return await agent.invoke({
+        messages: new HumanMessage(`Post a creative tweet about ${topic} & add emoji to express your sentiments,possiblly add image if you can`),
+      });
     });
     return response?.content;
-  } catch (error) {
-    console.error('Error generating tweet:', error);
+  } catch (error: any) {
+    console.error('LangChain agent failed:', error.message);
+
+    // 如果是网络连接问题，尝试 curl 备用方案
+    if (error.message?.includes('fetch failed') || error.message?.includes('GoogleGenerativeAI Error')) {
+      console.log('🔄 Trying curl fallback for tweet generation...');
+
+      try {
+        const fallbackResponse = await generateTweetWithCurl(topic);
+        console.log('✅ Curl fallback successful for tweet generation');
+        return fallbackResponse;
+      } catch (fallbackError) {
+        console.error('❌ Both LangChain and curl fallback failed');
+        throw new Error('All API methods failed. Please check network connection.');
+      }
+    }
+
     throw error;
   }
 }
 // Function to post the tweet using postTool
 export async function postTweet(content: string) {
   try {
+    // 首先检查 Twitter API 是否可用
+    const twitterAvailable = await testTwitterConnection();
+    
+    if (!twitterAvailable) {
+      console.log('🔄 Twitter API not available, using fallback method');
+      await postTweetFallback(content);
+      return;
+    }
+    
+    // 尝试使用真实的 Twitter API
     await agent.invoke({
       messages: new HumanMessage(`Post a creative tweet about ${content}`),
     });
     console.log(`Successfully posted tweet: ${content}`);
-  } catch (error) {
+  } catch (error: any) {
     console.error('Error posting tweet:', error);
+
+    // 如果是 Twitter API 问题，使用备用方案
+    if (error.message?.includes('Invalid consumer tokens') || 
+        error.message?.includes('Could not authenticate') ||
+        error.message?.includes('Request failed')) {
+      console.log('🔄 Twitter API failed, using fallback method');
+      await postTweetFallback(content);
+      return;
+    }
+
+    // 如果是网络问题，我们可以记录但不阻止程序继续运行
+    if (error.message?.includes('fetch failed') || error.message?.includes('GoogleGenerativeAI Error')) {
+      console.log('⚠️ Network issue detected, but tweet content was generated successfully');
+      console.log('Tweet content:', content);
+      await postTweetFallback(content);
+      return;
+    }
+
     throw error;
   }
 }
@@ -88,13 +220,13 @@ export async function replyToMention(mention: props) {
   try {
     const username = mention.user.screen_name;
     const tweetId = mention.id_str;
-   
- 
-      await agent.invoke({
-        messages: new HumanMessage(`Please reply using ${tweetId}`),
-      });
-      console.log(`Replied to mention from @${username}`);
-    
+
+
+    await agent.invoke({
+      messages: new HumanMessage(`Please reply using ${tweetId}`),
+    });
+    console.log(`Replied to mention from @${username}`);
+
   } catch (error) {
     console.error('Error replying to mention:', error);
     throw error;
@@ -106,7 +238,7 @@ export async function fetchTrendingTopics() {
   try {
     const trendsResponse = await agent.invoke({
       messages: [new HumanMessage('Get trending hashtags relevant to technology, AI, DAO, Blockchain, and Crypto etc')],
-      tools:[trendingTopicsTool]
+      tools: [trendingTopicsTool]
     });
     return trendsResponse?.content;
   } catch (error: unknown) {
@@ -139,7 +271,7 @@ export async function monitorAndPostRelevantTrends() {
     // Define the bot's focus topics
     const botTopics = ['DAO', 'AI agents', 'Blockchain', 'Crypto', 'Machine Learning'];
     // Filter trending topics based on relevance to the bot's focus
-    const relevantTrends = trendingTopics.filter((trend: string) => 
+    const relevantTrends = trendingTopics.filter((trend: string) =>
       botTopics.some(topic => trend.toLowerCase().includes(topic.toLowerCase()))
     );
     // Post tweets about the relevant trends
@@ -205,7 +337,7 @@ export async function searchTweetsByKeyword(keyword: string) {
   }
 }
 
-export async function likeATweet(tweetId: string, userId:string) {
+export async function likeATweet(tweetId: string, userId: string) {
   try {
     await agent.invoke({
       messages: [new HumanMessage(`Like the tweet with id '${tweetId}' and user "${userId}"`)],
@@ -232,13 +364,13 @@ export async function processTweets(tweets: tweetlikeprops[]) {
   for (const tweet of tweets) {
     const tweetId = tweet.id_str;
     const username = tweet.user.screen_name;
-    const  userId =  tweet.user.id_str;
+    const userId = tweet.user.id_str;
 
     // Analyze the sentiment of the tweet
- 
-      // Like the tweet if positive sentiment
-      await likeATweet(tweetId,  userId);
-    
+
+    // Like the tweet if positive sentiment
+    await likeATweet(tweetId, userId);
+
     // Reply to the tweet based on sentiment
     await replyToTweet(tweetId, username);
   }
@@ -246,7 +378,7 @@ export async function processTweets(tweets: tweetlikeprops[]) {
 // Modify the function to search tweets by trends and process them
 export async function searchTweetsUsingTrends() {
   const trendingTopics = await fetchTrendingTopics();  // Fetch trending topics
-  
+
   if (trendingTopics) {
     for (const trend of trendingTopics) {
       const foundTweets = await searchTweetsByKeyword(trend);
@@ -265,18 +397,18 @@ export async function scrapeCointelegraphHeadlines(url: string) {
     });
 
     // Log the entire JsonData object for debugging
- 
+
 
     if (JsonData && Array.isArray(JsonData.messages)) {
-    
-    const  data =  JsonData?.messages.find(
-      (message:msgProps) => message.name === "scrapeDataOnline_tool"
-    );
 
-    if(data){
-    return  data.content
-    }
-    
+      const data = JsonData?.messages.find(
+        (message: msgProps) => message.name === "scrapeDataOnline_tool"
+      );
+
+      if (data) {
+        return data.content
+      }
+
     } else {
       console.log("Invalid response structure.");
     }
@@ -287,45 +419,45 @@ export async function scrapeCointelegraphHeadlines(url: string) {
 }
 
 async function createRelevantPostBasedOnSentiment(headlines: string[]) {
-   try{
+  try {
     console.log("creating post from headlines...")
-    const response  =  await agent.invoke({
-       messages: [new HumanMessage(`using the "${headlines}" create an engaging  post , make sure  you  dont  repeat any headlines you had previously created  `)],
-     });
+    const response = await agent.invoke({
+      messages: [new HumanMessage(`using the "${headlines}" create an engaging  post , make sure  you  dont  repeat any headlines you had previously created  `)],
+    });
 
-     
-if(response && Array.isArray(response?.messages)){
-  const  data =  response?.messages.find(
-    (message:msgProps) => message.name === "post_tool"
-  );
 
-  if(data){
-    return data?.content
-  }
-}
-else{
- console.log({messagge:"cannot  create  a post or  invalid  data structure"})
-}
- 
-   }catch(error){
+    if (response && Array.isArray(response?.messages)) {
+      const data = response?.messages.find(
+        (message: msgProps) => message.name === "post_tool"
+      );
+
+      if (data) {
+        return data?.content
+      }
+    }
+    else {
+      console.log({ messagge: "cannot  create  a post or  invalid  data structure" })
+    }
+
+  } catch (error) {
     console.log(error)
-   }
+  }
 }
 export async function scrapeAndPostEveryTwoHours() {
- try {
-  console.log('Running Cointelegraph scrape and post cycle...');
-  
-  const headlines = await scrapeCointelegraphHeadlines("https://www.cointelegraph.com");  // Scrape Cointelegraph for headlines
+  try {
+    console.log('Running Cointelegraph scrape and post cycle...');
 
-  const  data  =  headlines;
-  if (headlines && headlines.length > 0) {
-    // Process the scraped headlines (analyze sentiment and create relevant posts)
-   const  response  =   await createRelevantPostBasedOnSentiment(data);
-      return  response;
-  }
- } catch (error) {
+    const headlines = await scrapeCointelegraphHeadlines("https://www.cointelegraph.com");  // Scrape Cointelegraph for headlines
+
+    const data = headlines;
+    if (headlines && headlines.length > 0) {
+      // Process the scraped headlines (analyze sentiment and create relevant posts)
+      const response = await createRelevantPostBasedOnSentiment(data);
+      return response;
+    }
+  } catch (error) {
     console.log(error)
- }
+  }
 }
 // Function to make the agent autonomous
 export async function autonomousAgentGoal(goal: string) {
@@ -345,7 +477,7 @@ export async function autonomousAgentGoal(goal: string) {
   }
 }
 
-( async function startBot() {
+(async function startBot() {
   console.log('Starting Twitter Bot...');
   try {
     const details = await agent.invoke({
@@ -354,7 +486,7 @@ export async function autonomousAgentGoal(goal: string) {
 
     // Find the message with the name "account_details_tools"
     const accountDetailsMessage = details.messages.find(
-      (message:msgProps) => message.name === "account_details_tools"
+      (message: msgProps) => message.name === "account_details_tools"
     );
 
     if (accountDetailsMessage) {
@@ -363,7 +495,7 @@ export async function autonomousAgentGoal(goal: string) {
       // Extract the name
       const name = accountDetails.name;
       console.log(`Name: ${name}`)
-      return  accountDetailsMessage
+      return accountDetailsMessage
     } else {
       console.log("Account details message not found.");
     }

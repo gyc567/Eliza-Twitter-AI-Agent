@@ -19,7 +19,7 @@ export async function  POST(request:NextRequest){
     try {
 
         const  response  = await generateTweet(data.data)
-        console.log("", response)
+        console.log("--response--", response)
         return NextResponse.json({
             data: response
         })
